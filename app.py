@@ -29,47 +29,85 @@ frame_buffer_lock = threading.Lock() # Para proteger el acceso a last_webcam_fra
 preview_thread_started = False
 preview_thread_lock = threading.Lock()
 
+# --- Configuración específica de la webcam ---
+WEBCAM_ID = 0 # Forzar webcam 0
+# Resolución base que se intenta obtener de la cámara (ej. 640x480, 1280x720, 1920x1080)
+# La cámara puede dar una resolución diferente a la solicitada, el código se adaptará.
+BASE_FRAME_WIDTH = 640
+BASE_FRAME_HEIGHT = 480 # Usaremos esta altura como ancla para el aspecto 9:16
+FPS = 30
+
+# --- Configuración de recorte a formato de celular (vertical) ---
+# Aspect ratio objetivo: Ancho / Alto (ej. 9/16 = 0.5625)
+TARGET_ASPECT_RATIO = 7 / 8
+
+# Dimensiones finales del frame después del recorte/reescalado para asegurar el aspecto 9:16
+# Si la altura es 480, el ancho para 9:16 será 480 * (9/16) = 270
+FINAL_OUTPUT_WIDTH = int(BASE_FRAME_HEIGHT * TARGET_ASPECT_RATIO)
+FINAL_OUTPUT_HEIGHT = BASE_FRAME_HEIGHT
+
+
 # --- Nombre del archivo de video de fallback (para pruebas sin webcam) ---
-VIDEO_FALLBACK_PATH = "sample_video_for_preview.mp4" 
+VIDEO_FALLBACK_PATH = "sample_video_for_preview.mp4"
+# --- Imagen de fallback estática si no hay frames de video/webcam ---
+STATIC_FALLBACK_IMAGE = "sample_comanda_fallback.png"
 
 # --- Función para capturar y enviar la orden (disparada por la tecla 'S' en la ventana CV2) ---
 def capture_and_send_order():
     """Toma el frame actual del buffer, lo codifica y envía via WebSocket."""
     global order_counter, last_webcam_frame
 
+    print("DEBUG: capture_and_send_order() - Iniciada.")
     encoded_image_string = ""
     frame_to_process = None
 
     # Acceder al último frame del buffer de forma segura
     with frame_buffer_lock:
-        if last_webcam_frame is not None:
-            frame_to_process = last_webcam_frame.copy() # Obtener una copia para procesar
+        if last_webcam_frame is not None and np.sum(last_webcam_frame) > 1000: # Solo si el frame no es negro
+            frame_to_process = last_webcam_frame.copy()
+        else:
+            print("DEBUG: capture_and_send_order() - last_webcam_frame es None o negro. No hay frame válido del preview.")
 
-    if frame_to_process is None:
-        print("ERROR (capture_and_send_order): No hay frame disponible del stream (webcam o video) para la captura.")
-        # Fallback a una imagen estática si no hay frame en vivo disponible
-        try:
-            with open("sample_comanda_fallback.png", "rb") as image_file:
-                encoded_image_string = base64.b64encode(image_file.read()).decode('utf-8')
-            print("Usando imagen de fallback estática porque no hay frame de webcam/video.")
-        except FileNotFoundError:
-            print("No hay frame de webcam/video y tampoco imagen de fallback. La orden se enviará sin imagen.")
-            return
+    # Si no se pudo obtener un frame válido del stream, intentar usar la imagen de fallback estática
+    if frame_to_process is None or np.sum(frame_to_process) < 1000: # También si el frame es negro
+        print("ERROR (capture_and_send_order): Frame de stream inválido/negro. Intentando fallback estático.")
+        if os.path.exists(STATIC_FALLBACK_IMAGE):
+            try:
+                fallback_img_data = cv2.imread(STATIC_FALLBACK_IMAGE)
+                if fallback_img_data is not None:
+                    # Redimensionar la imagen de fallback al tamaño FINAL CROPPEADO
+                    # Usar un tamaño consistente con el formato del celular
+                    fallback_img_data = cv2.resize(fallback_img_data, (FINAL_OUTPUT_WIDTH, FINAL_OUTPUT_HEIGHT))
+                    frame_to_process = fallback_img_data
+                    print(f"Usando imagen de fallback estática '{STATIC_FALLBACK_IMAGE}'.")
+                else:
+                    print(f"ADVERTENCIA: Fallback estático '{STATIC_FALLBACK_IMAGE}' no pudo cargarse con cv2.imread().")
+            except Exception as e:
+                print(f"ADVERTENCIA: Error al cargar fallback estático '{STATIC_FALLBACK_IMAGE}': {e}")
+        else:
+            print(f"ADVERTENCIA: Archivo de fallback estático '{STATIC_FALLBACK_IMAGE}' no encontrado.")
 
+    # Si después de todo, frame_to_process sigue siendo None o negro, no hay nada que enviar
+    if frame_to_process is None or np.sum(frame_to_process) < 1000:
+        print("ERROR CRÍTICO (capture_and_send_order): No se pudo obtener ningún frame válido (ni de stream ni de fallback). Saliendo sin emitir.")
+        return
+
+    # --- Depuración: Verificar el frame FINAL ANTES DE ENVIAR ---
+    if np.sum(frame_to_process) < 1000:
+        print("ADVERTENCIA (capture_and_send_order): EL FRAME FINAL A ENVIAR SIGUE SIENDO NEGRO O CASI VACÍO.")
     else:
-        # --- Depuración: Verificar si el frame es negro antes de enviar ---
-        if np.sum(frame_to_process) < 1000: # Suma de píxeles muy baja = frame casi negro
-            print("ADVERTENCIA (capture_and_send_order): El frame capturado para enviar parece ser negro o casi vacío.")
-        # --- Fin Depuración ---
+        print(f"DEBUG: capture_and_send_order() - Frame FINAL para enviar no es negro. Suma de píxeles: {np.sum(frame_to_process)}")
 
-        # Procesar el frame capturado
-        _, buffer = cv2.imencode('.png', frame_to_process)
-        encoded_image_string = base64.b64encode(buffer).decode('utf-8')
+    # Procesar el frame capturado
+    _, buffer = cv2.imencode('.png', frame_to_process)
+    encoded_image_string = base64.b64encode(buffer.tobytes()).decode('utf-8')
 
     order_counter += 1
     new_order_data = {
         'id': f'KDS-{order_counter:03d}',
-        'table': (order_counter % 10) + 1,
+        # CAMBIO AQUÍ: Eliminamos la operación de módulo.
+        # Ahora, el número de mesa será simplemente el order_counter actual.
+        'table': order_counter,
         'startedAt': datetime.now().strftime('%H:%M'),
         'status': 'NEW',
         'initialDuration': 15 * 60,
@@ -77,45 +115,49 @@ def capture_and_send_order():
         'image': f'data:image/png;base64,{encoded_image_string}' if encoded_image_string else ''
     }
 
-    print(f"Emitiendo nueva orden: {new_order_data['id']}")
+    print(f"DEBUG: capture_and_send_order() - Preparado para emitir orden {new_order_data['id']}.")
     with app.app_context():
         socketio.emit('new_order', new_order_data)
+        print(f"DEBUG: capture_and_send_order() - Orden {new_order_data['id']} emitida.")
 
-# --- Hilo para el Preview en Tiempo Real (Ventana CV2) ---
-def webcam_preview_thread():
-    global camera, last_webcam_frame
+# --- Función para inicializar la webcam/video ---
+def initialize_webcam():
+    """Inicializa la webcam 0 con configuraciones o usa fallback de video."""
+    global camera
 
-    print("Iniciando hilo de preview de webcam...")
-    
+    print(f"Intentando conectar a webcam {WEBCAM_ID}...")
+
     cap_attempts = [
-        (0, cv2.CAP_DSHOW),
-        (1, cv2.CAP_DSHOW),
-        (0, cv2.CAP_ANY),
-        (1, cv2.CAP_ANY)
+        (WEBCAM_ID, cv2.CAP_DSHOW), # DirectShow (Windows)
+        (WEBCAM_ID, cv2.CAP_V4L2),  # Video4Linux2 (Linux)
+        (WEBCAM_ID, cv2.CAP_ANY) # Backend automático
     ]
-    
+
     camera_opened = False
-    for cap_id, backend in cap_attempts:
-        print(f"Intentando abrir cámara ID {cap_id} con backend {backend}...")
-        camera = cv2.VideoCapture(cap_id, backend)
-        
-        # Configurar propiedades de la cámara para mejor rendimiento
+    for current_id, backend in cap_attempts:
+        print(f"  Intento: ID {current_id}, Backend {backend}...")
+        camera = cv2.VideoCapture(current_id + backend)
+
         if camera.isOpened():
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            camera.set(cv2.CAP_PROP_FPS, 30)
-            
-            # Hacer una lectura de prueba
+            # Configurar propiedades de la cámara a la resolución BASE
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, BASE_FRAME_WIDTH)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, BASE_FRAME_HEIGHT)
+            camera.set(cv2.CAP_PROP_FPS, FPS)
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Reducir buffer para menor latencia
+
+            # Verificar que la cámara funcione leyendo un frame de prueba que no sea negro
             ret, test_frame = camera.read()
-            if ret and test_frame is not None:
-                print(f"Webcam (ID {cap_id}, Backend {backend}) accedida exitosamente para preview en tiempo real.")
+            if ret and test_frame is not None and np.sum(test_frame) > 1000:
+                print(f"✓ Webcam {current_id}, Backend {backend} accedida correctamente.")
+                print(f"  Resolución (base): {int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))}, FPS: {camera.get(cv2.CAP_PROP_FPS)}")
                 camera_opened = True
                 break
             else:
-                print(f"Cámara ID {cap_id} abrió pero no puede leer frames.")
+                print(f"  Cámara ID {current_id} abrió pero no pudo leer frame de prueba válido/no negro con backend {backend}.")
                 camera.release()
+                camera = None
         else:
-            print(f"No se pudo acceder a la webcam con ID {cap_id} y Backend {backend}.")
+            print(f"  No se pudo abrir webcam {current_id} con backend {backend}.")
 
     # --- FALLBACK A VIDEO SI LA CÁMARA REAL NO FUNCIONA ---
     if not camera_opened:
@@ -124,153 +166,209 @@ def webcam_preview_thread():
             camera = cv2.VideoCapture(VIDEO_FALLBACK_PATH)
             if not camera.isOpened():
                 print(f"ERROR: No se pudo abrir el archivo de video: {VIDEO_FALLBACK_PATH}")
-                return # Si el video tampoco funciona, no hay preview
+                return False
             else:
+                # Configurar propiedades del video de fallback para que coincida con la resolución BASE
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, BASE_FRAME_WIDTH)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, BASE_FRAME_HEIGHT)
                 camera_opened = True
         else:
             print(f"ERROR: No se pudo acceder a la webcam en ningún intento y el archivo '{VIDEO_FALLBACK_PATH}' no existe.")
-            return # No se puede iniciar el preview sin cámara o video
+            return False
 
-    # Dar tiempo a la cámara/video para inicializarse
-    time.sleep(1)
+    return camera_opened
+
+# --- Hilo para el Preview en Tiempo Real (Ventana CV2) ---
+def webcam_preview_thread():
+    global camera, last_webcam_frame
+
+    if not initialize_webcam():
+        print("ERROR CRÍTICO: No se pudo inicializar ninguna fuente de video. Terminando hilo de preview.")
+        return
+
+    print("Iniciando preview de video...")
+
+    time.sleep(2) # Dar tiempo a la cámara/video para estabilizarse
 
     frame_count = 0
+    last_fps_time = time.time()
+
     while True:
         try:
             with camera_lock: # Bloquear el acceso a la cámara mientras se lee
+                if camera is None or not camera.isOpened():
+                    print("ERROR (webcam_preview_thread): Cámara/Video no disponible en bucle principal. Reintentando...")
+                    if initialize_webcam(): # Intenta re-inicializar
+                        print("Cámara re-inicializada con éxito.")
+                        continue
+                    else:
+                        break # Salir si no se puede re-inicializar
+
                 ret, frame = camera.read()
-            
+
             if not ret or frame is None:
                 # Si es un video, y se acaba, reiniciar
-                if camera_opened and hasattr(camera, 'get'):
-                    current_frame = camera.get(cv2.CAP_PROP_POS_FRAMES)
-                    total_frames = camera.get(cv2.CAP_PROP_FRAME_COUNT)
-                    if current_frame >= total_frames - 1:
-                        print("Video de fallback terminado, reiniciando...")
-                        camera.set(cv2.CAP_PROP_POS_FRAMES, 0) # Volver al inicio del video
-                        continue
+                if hasattr(camera, 'get') and camera.get(cv2.CAP_PROP_POS_FRAMES) == camera.get(cv2.CAP_PROP_FRAME_COUNT):
+                    print("Video de fallback terminado, reiniciando...")
+                    camera.set(cv2.CAP_PROP_POS_FRAMES, 0) # Volver al inicio del video
+                    continue
                 else:
                     print("ERROR (webcam_preview_thread): Falló la lectura del frame del preview. Reintentando...")
                     time.sleep(0.1)
                     continue
-            
+
+            # --- Procesamiento del frame para obtener el formato de celular ---
+            h, w, _ = frame.shape # Obtener dimensiones actuales del frame
+
+            # Calcular el ancho que la imagen debería tener para el aspect ratio objetivo, manteniendo la altura
+            # Si el frame original es 640x480 (4:3), y el objetivo es 9:16 (vertical),
+            # entonces para una altura de 480, el ancho objetivo es 480 * (9/16) = 270.
+            # Recortaremos 640 - 270 = 370px, 185px de cada lado.
+            target_w_for_h = int(h * TARGET_ASPECT_RATIO)
+
+            frame_processed = frame.copy() # Inicializar con el frame completo
+
+            # Si el ancho original es mayor que el ancho objetivo, recortamos los lados
+            if w > target_w_for_h:
+                crop_start_x = (w - target_w_for_h) // 2
+                crop_end_x = crop_start_x + target_w_for_h
+                frame_processed = frame[:, crop_start_x:crop_end_x]
+            # If original width is smaller than target width (e.g., already narrower than 9:16),
+            # or if it's already exactly 9:16 but smaller, it will simply be rescaled in the next step.
+
+            # Ensure the processed_frame has the expected FINAL OUTPUT dimensions
+            # This is necessary if the camera doesn't give exact resolution or if cropping didn't scale perfectly.
+            # And to standardize the output size for the frontend.
+            if frame_processed.shape[1] != FINAL_OUTPUT_WIDTH or frame_processed.shape[0] != FINAL_OUTPUT_HEIGHT:
+                frame_processed = cv2.resize(frame_processed, (FINAL_OUTPUT_WIDTH, FINAL_OUTPUT_HEIGHT))
+
+
+            # --- Debug: Only store frame if it's not black ---
+            if np.sum(frame_processed) > 1000: # If frame has pixels (is not black)
+                with frame_buffer_lock:
+                    last_webcam_frame = frame_processed.copy() # Save a copy of the PROCESSED frame
+            else:
+                print("WARNING (webcam_preview_thread): Preview frame appears to be black or nearly empty (will not be buffered).")
+
+            # Move FPS calculation and print outside the if so it's always done
             frame_count += 1
-            
-            # --- Depuración: Verificar si el frame del preview es negro ---
-            frame_sum = np.sum(frame)
-            if frame_sum < 1000: # Suma de píxeles muy baja = frame casi negro
-                print(f"ADVERTENCIA (webcam_preview_thread): Frame #{frame_count} parece ser negro o casi vacío (suma: {frame_sum}).")
-            # --- Fin Depuración ---
+            if frame_count % 30 == 0:
+                current_time = time.time()
+                fps = 30 / (current_time - last_fps_time)
+                last_fps_time = current_time
+                print(f"DEBUG: Preview FPS: {fps:.1f}, Current pixel sum: {np.sum(frame_processed)}") # Show sum of PROCESSED frame
 
-            # Almacenar el último frame en el buffer global de forma segura
-            with frame_buffer_lock:
-                last_webcam_frame = frame.copy() # Guardar una copia del último frame
+            # Add screen information (to the PROCESSED frame for the window)
+            # Ensure coordinates are relative to the processed_frame size
+            cv2.putText(frame_processed, f'Cam ID {WEBCAM_ID}',
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame_processed, f'Orders captured: {order_counter}',
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame_processed, f'Frame sum: {np.sum(frame_processed)}',
+                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame_processed, f'Press S to Capture / Q to Exit',
+                       (10, frame_processed.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Mostrar el feed en vivo
-            cv2.imshow('KDS Grill - Estacion de Captura (Presiona "S" para Capturar, "Q" para Salir)', frame)
-            
-            # Escuchar pulsaciones de teclas: 's' para snapshot, 'q' para salir de la ventana de preview
-            key = cv2.waitKey(1) & 0xFF # Esperar 1ms, obtener pulsación de tecla
-            
-            if key == ord('s'): # Tecla 's' para snapshot/captura
-                print("Tecla 'S' presionada. Disparando captura de comanda...")
-                # Llamar a la función de captura en un hilo separado para no bloquear el preview
+            # Show the live feed (the PROCESSED frame)
+            cv2.imshow('KDS Grill - Capture Station', frame_processed)
+
+            # Listen for key presses: 's' for snapshot, 'q' to exit preview window
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('s') or key == ord('S'):
+                print("Key 'S' pressed. Triggering order capture...")
                 threading.Thread(target=capture_and_send_order, daemon=True).start()
-                time.sleep(0.5) # Pequeña pausa para evitar multiples capturas si se mantiene 'S'
-            elif key == ord('q'): # Tecla 'q' para salir
-                print("Tecla 'Q' presionada. Cerrando ventana de captura.")
-                break # Salir del bucle del preview
-                
+                time.sleep(0.5)
+            elif key == ord('q') or key == ord('Q'):
+                print("Key 'Q' pressed. Closing capture window.")
+                break
+
         except Exception as e:
-            print(f"Error en el bucle de preview: {e}")
+            print(f"Error in preview loop: {e}")
             time.sleep(0.1)
             continue
 
-    # Liberar la cámara y destruir la ventana de OpenCV al salir del hilo
-    try:
-        if camera is not None:
-            camera.release()
-        cv2.destroyAllWindows()
-        print("Hilo de preview de webcam terminado correctamente.")
-    except Exception as e:
-        print(f"Error al cerrar recursos de cámara: {e}")
+    cleanup_camera()
+    print("Webcam preview thread terminated.")
 
-def start_preview_thread():
-    """Función para iniciar el hilo de preview de forma segura"""
+def cleanup_camera():
+    """Cleans up and releases camera resources."""
+    global camera
+
+    if camera is not None:
+        with camera_lock:
+            camera.release()
+            camera = None
+
+    cv2.destroyAllWindows()
+    print("Camera resources released.")
+
+# Functions to safely start/stop preview thread (for Werkzeug reloader)
+def start_preview_thread_safe():
     global preview_thread_started
-    
     with preview_thread_lock:
         if not preview_thread_started:
-            print("Iniciando hilo de preview de webcam...")
+            print("Starting webcam preview thread...")
             preview_thread = threading.Thread(target=webcam_preview_thread, daemon=True)
             preview_thread.start()
             preview_thread_started = True
             return True
         else:
-            print("Hilo de preview ya está en ejecución.")
+            print("Preview thread already running.")
             return False
 
-# --- Rutas HTTP de Flask (simples) ---
+# Flask HTTP routes (simple)
 @app.route('/')
 def index():
     return "KDS Grill Backend - WebSockets Active"
 
-@app.route('/start_preview')
-def start_preview():
-    """Ruta para iniciar manualmente el preview si es necesario"""
-    if start_preview_thread():
-        return "Preview iniciado correctamente"
-    else:
-        return "Preview ya está en ejecución"
-
-# --- Eventos de WebSocket (sin cambios) ---
+# WebSocket events (unchanged)
 @socketio.on('connect')
 def test_connect(auth=None):
-    print('Cliente conectado:', request.sid)
+    print('Client connected:', request.sid)
 
 @socketio.on('disconnect')
 def test_disconnect():
-    print('Cliente desconectado:', request.sid)
+    print('Client disconnected:', request.sid)
 
 @socketio.on('update_order_status')
 def handle_update_order_status(data):
     order_id = data.get('order_id')
     new_status = data.get('status')
-    print(f"Recibida actualización de orden {order_id} a estado {new_status} desde el frontend.")
+    print(f"Received order update {order_id} to status {new_status} from frontend.")
 
-# Bloque de ejecución principal
+@socketio.on('capture_order')
+def handle_manual_capture():
+    """Allow manual capture from frontend."""
+    print("Manual capture requested from frontend.")
+    threading.Thread(target=capture_and_send_order, daemon=True).start()
+
+# Main execution block
 if __name__ == '__main__':
-    print("Iniciando Flask-SocketIO server...")
-    
-    # Verificar si estamos en el proceso principal (no en el reloader de Werkzeug)
-    # Esto evita que se ejecuten múltiples hilos de preview cuando debug=True
+    print("=== KDS Grill - Order Capture System ===")
+    print(f"Configured to use webcam {WEBCAM_ID}")
+    print("Starting Flask-SocketIO server...")
+
     if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
-        print("Proceso principal detectado - iniciando hilo de preview")
-        start_preview_thread()
+        print("Main process detected - starting preview thread safely.")
+        start_preview_thread_safe()
     else:
-        print("Proceso de reloader detectado - saltando inicio de hilo de preview")
+        print("Reloader process detected - skipping preview thread startup.")
 
     try:
-        # Usar use_reloader=False para evitar problemas con hilos duplicados
-        # pero mantener debug=True para otras funcionalidades de desarrollo
         socketio.run(
-            app, 
-            host='0.0.0.0', 
-            port=5000, 
-            debug=True, 
-            use_reloader=False,  # Esta es la clave para evitar ventanas duplicadas
+            app,
+            host='0.0.0.0',
+            port=5000,
+            debug=True,
+            use_reloader=False,
             allow_unsafe_werkzeug=True
         )
+    except KeyboardInterrupt:
+        print("\nUser interruption detected...")
     except Exception as e:
-        print(f"Error al iniciar el servidor Flask-SocketIO: {e}")
+        print(f"Error starting Flask-SocketIO server: {e}")
     finally:
-        # Asegurarse de cerrar todas las ventanas de OpenCV cuando la aplicación principal termina
-        try:
-            cv2.destroyAllWindows()
-            # Si la cámara se liberó en el hilo de preview, esta línea no hace nada si ya es None
-            if camera is not None:
-                camera.release()
-            print("Recursos de cámara liberados correctamente.")
-        except Exception as e:
-            print(f"Error al liberar recursos: {e}")
-        print("Aplicación Flask-SocketIO terminada.")
+        print("Closing application...")
+        cleanup_camera()
+        print("Flask-SocketIO application terminated.")
